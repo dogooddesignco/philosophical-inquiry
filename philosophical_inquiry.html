@@ -546,11 +546,16 @@ async function screenTopic(topic) {
 /* ═══════════════════════════════════════════
    API CALL
    ═══════════════════════════════════════════ */
+// Simple single-turn call (for screening, moderator, joint formulation)
 async function callAPI(systemPrompt, userContent) {
-  return callAPIWithMessages(systemPrompt, [{ role: "user", content: userContent }]);
+  const result = await callAPIWithSession(systemPrompt, userContent);
+  return result.text;
 }
 
-async function callAPIWithMessages(systemPrompt, messages) {
+// Session-aware API call. Returns { text, sessionId }.
+// For CLI mode: uses --session-id (first call) or --resume (subsequent calls) for true persistent sessions.
+// For API key mode: sends full messages array for multi-turn continuity.
+async function callAPIWithSession(systemPrompt, userContent, sessionState) {
   const useCLI = authMode === 'cli';
   const key = document.getElementById('api-key').value.trim();
   if (!useCLI && !key) throw new Error("API key is required");
@@ -566,6 +571,30 @@ async function callAPIWithMessages(systemPrompt, messages) {
     headers["anthropic-dangerous-direct-browser-access"] = "true";
   }
 
+  // Build request body
+  const requestBody = {
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1000,
+    system: systemPrompt,
+  };
+
+  if (useCLI && sessionState?.sessionId) {
+    // CLI persistent session: resume existing session, only send latest message
+    requestBody.messages = [{ role: "user", content: userContent }];
+    requestBody.resume_session = sessionState.sessionId;
+  } else if (useCLI && sessionState) {
+    // CLI persistent session: first call, generate a session ID
+    requestBody.messages = [{ role: "user", content: userContent }];
+    requestBody.session_id = crypto.randomUUID();
+  } else if (!useCLI && sessionState?.messages) {
+    // API key mode: send full message history for multi-turn
+    const msgs = [...sessionState.messages, { role: "user", content: userContent }];
+    requestBody.messages = msgs;
+  } else {
+    // Single-turn (no session)
+    requestBody.messages = [{ role: "user", content: userContent }];
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
 
@@ -574,12 +603,7 @@ async function callAPIWithMessages(systemPrompt, messages) {
       method: "POST",
       headers,
       signal: controller.signal,
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
-        system: systemPrompt,
-        messages,
-      }),
+      body: JSON.stringify(requestBody),
     });
     clearTimeout(timeout);
 
@@ -590,7 +614,9 @@ async function callAPIWithMessages(systemPrompt, messages) {
 
     const data = await res.json();
     if (!data?.content?.length) throw new Error("Empty response");
-    return data.content.map(b => b.text || "").join("\n").trim();
+    const text = data.content.map(b => b.text || "").join("\n").trim();
+
+    return { text, sessionId: data.session_id || sessionState?.sessionId };
   } catch (e) {
     clearTimeout(timeout);
     if (e.name === "AbortError") throw new Error("Request timed out");
@@ -733,9 +759,15 @@ async function beginInquiry() {
   const allModReports = [];
   let formulating = false;
 
-  // Per-tradition conversation histories for multi-turn continuity
-  const traditionHistories = {};
-  active.forEach(t => { traditionHistories[t.id] = []; });
+  // Per-tradition session state for persistent conversations
+  // CLI mode: stores { sessionId } — the CLI maintains full context
+  // API key mode: stores { messages: [] } — we maintain the messages array
+  const traditionSessions = {};
+  active.forEach(t => {
+    traditionSessions[t.id] = authMode === 'cli'
+      ? { sessionId: null }  // Will be set after first call
+      : { messages: [] };
+  });
 
   try {
     // Screen the topic before engaging any tradition agents
@@ -777,17 +809,21 @@ async function beginInquiry() {
         const sys = buildTraditionSystemPrompt(t.name);
         const usr = buildTraditionUserMessage(topic, round, latestRoundDialogue, formulating);
 
-        // Append user message to this tradition's conversation history
-        traditionHistories[t.id].push({ role: "user", content: usr });
-        const text = await callAPIWithMessages(sys, traditionHistories[t.id]);
-        // Append assistant response to maintain continuity
-        traditionHistories[t.id].push({ role: "assistant", content: text });
+        const result = await callAPIWithSession(sys, usr, traditionSessions[t.id]);
 
-        roundResponses.push({ tradition: t.name, traditionId: t.id, text });
+        // Update session state for next call
+        if (authMode === 'cli') {
+          traditionSessions[t.id].sessionId = result.sessionId;
+        } else {
+          traditionSessions[t.id].messages.push({ role: "user", content: usr });
+          traditionSessions[t.id].messages.push({ role: "assistant", content: result.text });
+        }
+
+        roundResponses.push({ tradition: t.name, traditionId: t.id, text: result.text });
 
         responsesEl.innerHTML += `<div class="response-card" style="border-left:3px solid ${t.color}">
           <div class="resp-name" style="color:${t.color}">${t.icon} ${t.name}</div>
-          <div class="resp-text">${esc(text)}</div></div>`;
+          <div class="resp-text">${esc(result.text)}</div></div>`;
         document.getElementById(`round-meta-${round}`).textContent = `${roundResponses.length} perspective${roundResponses.length !== 1 ? 's' : ''}`;
         container.scrollTop = container.scrollHeight;
       }
@@ -868,16 +904,21 @@ async function beginInquiry() {
           const sys = buildTraditionSystemPrompt(t.name);
           const usr = buildReviewUserMessage(topic, draftFormulation);
 
-          // Continue this tradition's conversation for the review
-          traditionHistories[t.id].push({ role: "user", content: usr });
-          const reviewText = await callAPIWithMessages(sys, traditionHistories[t.id]);
-          traditionHistories[t.id].push({ role: "assistant", content: reviewText });
+          // Continue this tradition's persistent session for the review
+          const reviewResult = await callAPIWithSession(sys, usr, traditionSessions[t.id]);
 
-          reviews.push({ tradition: t.name, traditionId: t.id, text: reviewText });
+          if (authMode === 'cli') {
+            traditionSessions[t.id].sessionId = reviewResult.sessionId;
+          } else {
+            traditionSessions[t.id].messages.push({ role: "user", content: usr });
+            traditionSessions[t.id].messages.push({ role: "assistant", content: reviewResult.text });
+          }
+
+          reviews.push({ tradition: t.name, traditionId: t.id, text: reviewResult.text });
 
           reviewsEl.innerHTML += `<div class="response-card" style="border-left:3px solid ${t.color}">
             <div class="resp-name" style="color:${t.color}">${t.icon} ${t.name}</div>
-            <div class="resp-text">${esc(reviewText)}</div></div>`;
+            <div class="resp-text">${esc(reviewResult.text)}</div></div>`;
           document.getElementById('review-meta').textContent = `${reviews.length} review${reviews.length !== 1 ? 's' : ''}`;
           container.scrollTop = container.scrollHeight;
         }
