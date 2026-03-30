@@ -25,15 +25,26 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         messages = body.get("messages", [])
         model = body.get("model", "claude-sonnet-4-20250514")
 
-        # Extract user content from messages
-        user_content = ""
-        for msg in messages:
-            if msg["role"] == "user":
-                user_content = msg["content"] if isinstance(msg["content"], str) else json.dumps(msg["content"])
-
-        if not user_content:
-            self.send_json(400, {"error": {"message": "No user message provided"}})
+        if not messages:
+            self.send_json(400, {"error": {"message": "No messages provided"}})
             return
+
+        # For multi-turn conversations, build a combined prompt
+        # Single-turn: just use the user content directly
+        # Multi-turn: format prior turns as context, latest user message as the prompt
+        if len(messages) == 1:
+            user_content = messages[0]["content"] if isinstance(messages[0]["content"], str) else json.dumps(messages[0]["content"])
+        else:
+            # Build conversation context for multi-turn
+            parts = []
+            for msg in messages[:-1]:
+                role_label = "Human" if msg["role"] == "user" else "Assistant"
+                content = msg["content"] if isinstance(msg["content"], str) else json.dumps(msg["content"])
+                parts.append(f"[{role_label}]: {content}")
+            # Latest message is the current prompt
+            last = messages[-1]
+            last_content = last["content"] if isinstance(last["content"], str) else json.dumps(last["content"])
+            user_content = "Previous conversation:\n" + "\n\n".join(parts) + "\n\n---\n\nCurrent message:\n" + last_content
 
         # Build claude CLI command
         cmd = ["claude", "-p", user_content, "--model", model, "--output-format", "json"]

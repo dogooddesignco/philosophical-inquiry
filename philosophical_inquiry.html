@@ -410,12 +410,12 @@ RULES:
 - 150-250 words maximum. Density over length.`;
 }
 
-function buildTraditionUserMessage(topic, round, priorDialogue, formulate) {
+function buildTraditionUserMessage(topic, round, latestRoundDialogue, formulate) {
   let msg = `TOPIC: "${topic}"`;
   if (round === 1) {
     msg += `\n\nThis is your first response. No other perspectives are available yet. Give your genuine, uncompromised response through the lens of your tradition.`;
   } else {
-    msg += `\n\nPrior dialogue:\n${priorDialogue}`;
+    msg += `\n\nHere is what the other traditions said in the latest round:\n${latestRoundDialogue}`;
     if (formulate) {
       msg += `\n\nIt is time to formulate. Propose the most honest single-paragraph answer to the original question that you could endorse — even if it incorporates insights from other traditions. Use your own tradition's voice, but account for what has been genuinely established across perspectives. Flag anything in your formulation that another tradition present would likely see differently.`;
     } else {
@@ -448,8 +448,13 @@ Evaluate every inquiry on these criteria:
 Respond ONLY in this JSON format with no markdown formatting, no backticks, no code fences:
 {"verdict":"CONTINUE or FORMULATE or RESOLVED or HONEST_DIVERGENCE","tradition_integrity":[{"tradition":"name","issue":"description"}],"frame_dominance":"whose vocabulary is shaping the discourse and how","depth_score":1-10,"organic_alignments":["description of any genuine independent convergences"],"irreducible_tensions":["description of real disagreements"],"unresolved":["what remains unexamined or unresolved"],"synthesis":"if RESOLVED: the single shared answer. if HONEST_DIVERGENCE: the map of where and why they diverge. if FORMULATE: why it is time. if CONTINUE: what is still unresolved"}`;
 
-function buildModeratorUserMessage(topic, dialogue, round, tradNames) {
-  return `Topic: "${topic}"\nTraditions present: ${tradNames.join(", ")}\nCurrent round: ${round}\n\nFull dialogue so far:\n${dialogue}\n\nEvaluate the current state of this inquiry.`;
+function buildModeratorUserMessage(topic, dialogue, round, tradNames, minFormulationRound) {
+  let msg = `Topic: "${topic}"\nTraditions present: ${tradNames.join(", ")}\nCurrent round: ${round}`;
+  if (minFormulationRound && round < minFormulationRound) {
+    msg += `\nNote: Formulation is not available until round ${minFormulationRound}. Do not issue a FORMULATE verdict before then.`;
+  }
+  msg += `\n\nFull dialogue so far:\n${dialogue}\n\nEvaluate the current state of this inquiry.`;
+  return msg;
 }
 
 const JOINT_FORMULATION_SYSTEM_PROMPT = `You are a synthesizer. You have observed a multi-tradition philosophical inquiry where each tradition has now offered its own formulation — its best honest answer to the question, in its own voice.
@@ -542,6 +547,10 @@ async function screenTopic(topic) {
    API CALL
    ═══════════════════════════════════════════ */
 async function callAPI(systemPrompt, userContent) {
+  return callAPIWithMessages(systemPrompt, [{ role: "user", content: userContent }]);
+}
+
+async function callAPIWithMessages(systemPrompt, messages) {
   const useCLI = authMode === 'cli';
   const key = document.getElementById('api-key').value.trim();
   if (!useCLI && !key) throw new Error("API key is required");
@@ -569,7 +578,7 @@ async function callAPI(systemPrompt, userContent) {
         model: "claude-sonnet-4-20250514",
         max_tokens: 1000,
         system: systemPrompt,
-        messages: [{ role: "user", content: userContent }],
+        messages,
       }),
     });
     clearTimeout(timeout);
@@ -701,6 +710,7 @@ async function beginInquiry() {
   const active = TRADITIONS.filter(t => selected.has(t.id));
   const MAX_ROUNDS = 10;
   const deadline = parseInt(document.getElementById('formulation-deadline').value) || 0;
+  const minFormulationRound = Math.max(2, deadline > 0 ? deadline : 2);
 
   // Switch to inquiry view
   document.getElementById('nav-setup').textContent = 'Inquiry';
@@ -723,6 +733,10 @@ async function beginInquiry() {
   const allModReports = [];
   let formulating = false;
 
+  // Per-tradition conversation histories for multi-turn continuity
+  const traditionHistories = {};
+  active.forEach(t => { traditionHistories[t.id] = []; });
+
   try {
     // Screen the topic before engaging any tradition agents
     setStatus('Screening topic...');
@@ -738,10 +752,11 @@ async function beginInquiry() {
       if (aborted) break;
       setStatus(`Round ${round} — gathering perspectives...`);
 
-      let priorDialogue = "";
-      for (const r of allRounds) {
-        priorDialogue += `\n--- Round ${r.round} ---\n`;
-        for (const resp of r.responses) priorDialogue += `[${resp.tradition}]: ${resp.text}\n\n`;
+      // Only send the latest round's responses — prior context lives in conversation history
+      let latestRoundDialogue = "";
+      if (allRounds.length > 0) {
+        const lastRound = allRounds[allRounds.length - 1];
+        for (const resp of lastRound.responses) latestRoundDialogue += `[${resp.tradition}]: ${resp.text}\n\n`;
       }
 
       // Round header
@@ -760,8 +775,14 @@ async function beginInquiry() {
         setStatus(`Round ${round} — ${t.name} is thinking...`);
 
         const sys = buildTraditionSystemPrompt(t.name);
-        const usr = buildTraditionUserMessage(topic, round, priorDialogue, formulating);
-        const text = await callAPI(sys, usr);
+        const usr = buildTraditionUserMessage(topic, round, latestRoundDialogue, formulating);
+
+        // Append user message to this tradition's conversation history
+        traditionHistories[t.id].push({ role: "user", content: usr });
+        const text = await callAPIWithMessages(sys, traditionHistories[t.id]);
+        // Append assistant response to maintain continuity
+        traditionHistories[t.id].push({ role: "assistant", content: text });
+
         roundResponses.push({ tradition: t.name, traditionId: t.id, text });
 
         responsesEl.innerHTML += `<div class="response-card" style="border-left:3px solid ${t.color}">
@@ -782,7 +803,7 @@ async function beginInquiry() {
         for (const resp of r.responses) fullDialogue += `[${resp.tradition}]: ${resp.text}\n\n`;
       }
 
-      const modRaw = await callAPI(MODERATOR_SYSTEM_PROMPT, buildModeratorUserMessage(topic, fullDialogue, round, active.map(t => t.name)));
+      const modRaw = await callAPI(MODERATOR_SYSTEM_PROMPT, buildModeratorUserMessage(topic, fullDialogue, round, active.map(t => t.name), minFormulationRound));
 
       let mod;
       try {
@@ -792,13 +813,13 @@ async function beginInquiry() {
           tradition_integrity: [], frame_dominance: "Unable to parse", organic_alignments: [], irreducible_tensions: [] };
       }
 
-      // Enforce minimum 2 rounds before any formulation — traditions must see each other's work
-      if (round < 2 && mod.verdict === "FORMULATE") {
+      // Before the minimum formulation round: block any FORMULATE verdict from the moderator
+      if (round < minFormulationRound && (mod.verdict === "FORMULATE")) {
         mod.verdict = "CONTINUE";
       }
 
-      // If deadline is set and we've hit it, force formulation (still respects min 2 rounds)
-      if (deadline > 0 && round >= Math.max(deadline, 2) && !formulating && mod.verdict === "CONTINUE") {
+      // At or past the deadline: force formulation if moderator hasn't already called it
+      if (deadline > 0 && round >= minFormulationRound && !formulating && mod.verdict === "CONTINUE") {
         mod.verdict = "FORMULATE";
       }
 
@@ -846,7 +867,12 @@ async function beginInquiry() {
 
           const sys = buildTraditionSystemPrompt(t.name);
           const usr = buildReviewUserMessage(topic, draftFormulation);
-          const reviewText = await callAPI(sys, usr);
+
+          // Continue this tradition's conversation for the review
+          traditionHistories[t.id].push({ role: "user", content: usr });
+          const reviewText = await callAPIWithMessages(sys, traditionHistories[t.id]);
+          traditionHistories[t.id].push({ role: "assistant", content: reviewText });
+
           reviews.push({ tradition: t.name, traditionId: t.id, text: reviewText });
 
           reviewsEl.innerHTML += `<div class="response-card" style="border-left:3px solid ${t.color}">
