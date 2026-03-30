@@ -485,7 +485,7 @@ Rules:
 - 50-100 words maximum. Only substance.`;
 
 function buildReviewUserMessage(topic, jointFormulation) {
-  return `TOPIC: "${topic}"\n\nProposed joint formulation:\n"${jointFormulation}"\n\nReview this formulation from your tradition's perspective. What is accurate? What is missing or distorted?`;
+  return `TOPIC: "${topic}"\n\nA joint formulation has been proposed that attempts to synthesize insights from all traditions present:\n\n"${jointFormulation}"\n\nReview this formulation from your tradition's perspective. Is it honest and complete?\n\n- If it is accurate from your perspective, say so briefly and explain why.\n- If something important is missing, distorted, or papered over, say exactly what and why it matters.\n- If a tension was glossed over that your tradition considers irreducible, flag it.\n- 50-100 words maximum. Only substance.`;
 }
 
 const FINAL_FORMULATION_SYSTEM_PROMPT = `You are finalizing a joint formulation for a multi-tradition philosophical inquiry. You previously produced a draft joint formulation, and each tradition has now reviewed it and offered suggestions.
@@ -792,8 +792,13 @@ async function beginInquiry() {
           tradition_integrity: [], frame_dominance: "Unable to parse", organic_alignments: [], irreducible_tensions: [] };
       }
 
-      // If deadline is set and we've hit it, force formulation
-      if (deadline > 0 && round >= deadline && !formulating && mod.verdict === "CONTINUE") {
+      // Enforce minimum 2 rounds before any formulation — traditions must see each other's work
+      if (round < 2 && mod.verdict === "FORMULATE") {
+        mod.verdict = "CONTINUE";
+      }
+
+      // If deadline is set and we've hit it, force formulation (still respects min 2 rounds)
+      if (deadline > 0 && round >= Math.max(deadline, 2) && !formulating && mod.verdict === "CONTINUE") {
         mod.verdict = "FORMULATE";
       }
 
@@ -839,7 +844,7 @@ async function beginInquiry() {
           const t = active[i];
           setStatus(`${t.name} reviewing formulation...`);
 
-          const sys = REVIEW_FORMULATION_SYSTEM_PROMPT;
+          const sys = buildTraditionSystemPrompt(t.name);
           const usr = buildReviewUserMessage(topic, draftFormulation);
           const reviewText = await callAPI(sys, usr);
           reviews.push({ tradition: t.name, traditionId: t.id, text: reviewText });
@@ -1020,7 +1025,8 @@ function renderPrompts() {
     <div class="label" style="margin-bottom:14px;margin-top:28px">Joint Formulation Process</div>
     <div class="section-note">After traditions produce individual formulations, a three-step synthesis process produces one final answer: the moderator drafts a joint formulation, each tradition reviews it, and the moderator incorporates feedback into the final statement.</div>
     ${promptBlock('jf-draft', '#7ab0d4', '👁 Moderator', 'Step 1: Draft Joint Formulation', JOINT_FORMULATION_SYSTEM_PROMPT, false)}
-    ${promptBlock('jf-review', '#c8965a', 'Tradition Review', 'Step 2: Each tradition reviews the draft', REVIEW_FORMULATION_SYSTEM_PROMPT, false)}
+    ${promptBlock('jf-review', '#c8965a', 'Tradition Review', 'Step 2: Each tradition reviews the draft (uses tradition\'s own system prompt)',
+      'System prompt: [same tradition agent prompt as always]\n\nUser message:\nTOPIC: "[the inquiry topic]"\n\nA joint formulation has been proposed that attempts to synthesize insights from all traditions present:\n\n"[the draft formulation]"\n\nReview this formulation from your tradition\'s perspective. Is it honest and complete?\n\n- If it is accurate from your perspective, say so briefly and explain why.\n- If something important is missing, distorted, or papered over, say exactly what and why it matters.\n- If a tension was glossed over that your tradition considers irreducible, flag it.\n- 50-100 words maximum. Only substance.', true)}
     ${promptBlock('jf-final', '#6bb07a', '👁 Moderator', 'Step 3: Final Formulation (incorporates feedback)', FINAL_FORMULATION_SYSTEM_PROMPT, false)}
 
     <div class="arch-notes">
